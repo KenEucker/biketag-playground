@@ -1,140 +1,158 @@
 import dotenv from "dotenv";
 import { BikeTagClient } from "biketag";
-import { createWriteStream, existsSync, createReadStream } from "fs";
-import { join, extname } from "path";
-import axios from "axios";
-import { uploadTagImagePayload } from "biketag/lib/common/payloads";
+import { readFileSync } from "fs";
 import { Client as GoogleMapsClient } from "@googlemaps/google-maps-services-js";
 import { PlaceInputType } from "@googlemaps/google-maps-services-js/dist/common";
-import { Game, Tag } from "biketag/lib/common/schema";
+import { Game, Tag } from "biketag";
+import { helpers } from "biketag";
+import { resolve } from "path";
+import { delay, normalizeLocationInput } from "./helpers";
+import axios from "axios";
 
 const googleMapsClient = new GoogleMapsClient({});
 
 dotenv.config();
 let startingNumber = parseInt(process.env.START ?? "0");
+const gameName = process.env.BIKETAG_GAME;
 const limit = parseInt(process.env.LIMIT ?? "0");
-const overWriteExistingTags = process.env.OVERWRITE === "true";
-const doProperUpdate = !process.env.UPDATE || process.env.UPDATE === "true";
-const downloadingImages = process.env.DOWNLOAD_IMAGES === "true";
+const dryRun = process.env.DRY_RUN === "true";
+const migrateFromFile = process.env.MIGRATE_INPUT_FILE;
+const migrateFromFileGame = process.env.MIGRATE_GAME ?? gameName;
+const doResizeOnUpload = process.env.RESIZE_AND_VARIANTS === "true";
+const fromSource = process.env.BIKETAG_SOURCE ?? "imgur";
+const toSource = process.env.BIKETAG_DESTINATION ?? "aws";
+const delayMs = !Number.isNaN(parseInt(process.env.UPLOAD_DELAY))
+  ? parseInt(process.env.UPLOAD_DELAY)
+  : 200;
+const getGps = process.env.GET_GPS_ON_UPLOAD === "true";
+const googleApiKey = process.env.GOOGLE_API_KEY;
 
-function downloadImage(url: string, path: string): Promise<string> {
-  if (existsSync(path)) {
-    return Promise.resolve(path);
+const getBikeTagGPSLocation2 = async (tag: Tag, opts: any) => {
+  const cityContext = opts.region?.zipcode ? `${opts.region.description} ${opts.region.zipcode}` : opts.region?.description;
+
+  const rawInput = (tag.foundLocation ?? "").trim();
+  if (!rawInput) {
+    console.warn("✗ Skipping GPS lookup: empty foundLocation.");
+    return undefined;
   }
-  return new Promise(async (resolve, reject) => {
-    const writer = createWriteStream(path);
 
-    const response = await axios({
-      url,
-      method: "GET",
-      responseType: "stream",
+  const normalizedInput = normalizeLocationInput(rawInput);
+  const fullQuery = `${normalizedInput}, ${cityContext}`.trim();
+
+  try {
+    console.log('trying to get gps coordinates for', fullQuery)
+    const boundary = `${opts.boundary.lat},${opts.boundary.lng}`
+    const response = await axios.get("https://maps.googleapis.com/maps/api/geocode/json", {
+      params: {
+        key: googleApiKey,
+        address: fullQuery,
+        ...(opts.boundary && {
+          location: boundary,
+          radius: 1000,
+        }),
+      },
+      timeout: 1000,
     });
 
-    response.data.pipe(writer);
-    writer.on("finish", () => {
-      resolve(path);
-    });
-    writer.on("error", reject);
-  });
-}
+    const result = response.data.results?.[0];
+    const location = result?.geometry?.location;
 
-const getBikeTagImageFileName = (
-  game: string,
-  type: "found" | "mystery",
-  number: number,
-  ext: string
-) => {
-  return `BikeTag-${game}-${number}-${type}${ext.replace("?1", "")}`;
+    if (location?.lat !== undefined && location?.lng !== undefined) {
+      return { lat: location.lat, long: location.lng, alt: 0 };
+    }
+
+    console.warn(`⚠ Geocoding API did not return location for "${fullQuery}"`);
+  } catch (e: any) {
+    console.error(
+      `✗ Geocoding API error for "${rawInput}":`,
+      e?.response?.data?.error_message || `status ${e?.response?.status}`
+    );
+  }
+
+  return undefined;
 };
+
 
 const getBikeTagGPSLocation = async (tag: Tag, opts: any) => {
-  let gps = undefined;
-  await googleMapsClient
-    .findPlaceFromText({
-      params: {
-        key: opts.googleApiKey,
-        input: tag.foundLocation,
-        inputtype: PlaceInputType.textQuery,
-        fields: ["formatted_address", "name", "geometry"],
-        locationbias: opts.boundary
-          ? `circle:60660@${opts.boundary.lat},${opts.boundary.long}`
-          : "",
-      },
-      timeout: 1000, // milliseconds
-    })
-    .then((r) => {
-      const candidates = r.data.candidates;
-      const chosenGeometry = candidates.length
-        ? candidates[0]?.geometry?.location
-        : null;
-      gps = chosenGeometry;
-    })
-    .catch((e) => {
-      console.log(
-        e.response.data.error_message || `error ${e.response.status}`
+  const cityContext = opts.region?.zipcode ? `${opts.region.description} ${opts.region.zipcode}` : opts.region?.description;
+  const rawInput = (tag.foundLocation ?? "").trim();
+  if (!rawInput) {
+    console.warn("✗ Skipping GPS lookup: empty foundLocation.");
+    return undefined;
+  }
+
+  const normalizedInput = normalizeLocationInput(rawInput);
+  const locationbias = opts.boundary
+    ? `point:${opts.boundary.lat},${opts.boundary.lng}`
+    : "";
+
+  const fullQuery = `${normalizedInput} ${cityContext}`
+  const tryLookup = async (input: string) => {
+    console.log(`→ Trying GPS lookup for: "${input}"`);
+    try {
+      const r = await googleMapsClient.findPlaceFromText({
+        params: {
+          key: googleApiKey,
+          input,
+          inputtype: PlaceInputType.textQuery,
+          fields: ["formatted_address", "name", "geometry"],
+          locationbias,
+        },
+        timeout: 1000,
+      });
+
+      const candidates = r.data?.candidates ?? [];
+      const location = candidates[0]?.geometry?.location;
+
+      if (location?.lat !== undefined && location?.lng !== undefined) {
+        return { lat: location.lat, long: location.lng, alt: 0 };
+      }
+
+      return null;
+    } catch (e: any) {
+      console.error(
+        `✗ Google API error for "${input}":`,
+        e?.response?.data?.error_message || `status ${e?.response?.status}`
       );
-    });
-  return gps;
+      return null;
+    }
+  };
+
+  const result = await tryLookup(fullQuery);
+  if (result) {
+    return result;
+  }
+
+  console.warn(`⚠ No GPS match found for tag ${tag.tagnumber} with input: "${rawInput}"`);
+  return undefined;
 };
 
-function downloadBikeTagImages(tag: Tag): Promise<string>[] {
-  const biketagImageFolder = join(__dirname, "images");
-  const downloadPromises = [];
 
-  if (!tag.foundImage && tag.foundImageUrl) {
-    const ext = extname(tag.foundImageUrl);
-    const originalImageUrl =
-      tag.foundImageUrl.indexOf("imgur.com") !== -1
-        ? tag.foundImageUrl.replace(ext, `l${ext}`)
-        : tag.foundImageUrl;
-    downloadPromises.push(
-      downloadImage(
-        originalImageUrl,
-        join(
-          biketagImageFolder,
-          getBikeTagImageFileName(tag.game, "found", tag.tagnumber, ext)
-        )
-      )
-    );
-  } else {
-    console.log({ noFoundTag: tag });
-  }
-  if (!tag.mysteryImage && tag.mysteryImageUrl) {
-    const ext = extname(tag.mysteryImageUrl);
-    const originalImageUrl =
-      tag.mysteryImageUrl.indexOf("imgur.com") !== -1
-        ? tag.mysteryImageUrl.replace(ext, `l${ext}`)
-        : tag.mysteryImageUrl;
-    downloadPromises.push(
-      downloadImage(
-        originalImageUrl,
-        join(
-          biketagImageFolder,
-          getBikeTagImageFileName(tag.game, "mystery", tag.tagnumber, ext)
-        )
-      )
-    );
-  } else {
-    console.log({ noMysteryTag: tag });
-  }
 
-  return downloadPromises;
+if (!gameName?.length) {
+  console.log("no game, no dice");
+  process.exit();
 }
 
 const opts = {
-  game: process.env.BIKETAG_GAME ?? "test",
+  game: gameName,
   imgur: {
     hash: process.env.BIKETAG_DESTINATION_IMGUR_HASH,
-    clientId: process.env.IMGUR_CLIENT_ID,
+    clientId: process.env.IMGUR_CLIENT_ID ?? process.env.I_CID,
     clientSecret: process.env.IMGUR_CLIENT_SECRET,
     accessToken: process.env.IMGUR_ACCESS_TOKEN,
-    rapidApiKey: process.env.RAPID_API_KEY,
+    rapidApiKey: process.env.RAPID_API_KEY ?? process.env.RA_FE_KEY,
   },
   sanity: {
     useCdn: false,
     token: process.env.SANITY_ACCESS_TOKEN,
     projectId: process.env.SANITY_PROJECT_ID,
     dataset: process.env.SANITY_DATASET,
+  },
+  aws: {
+    accessKeyId: process.env.S3_AID ?? process.env.S3_ACCESS_ID ?? null,
+    secretAccessKey: process.env.S3_AKEY ?? process.env.S3_ACCESS_KEY ?? null,
+    region: "",
   },
   // reddit: {
   //   subreddit: process.env.REDDIT_SUBREDDIT ?? "cyclepdx",
@@ -143,193 +161,291 @@ const opts = {
   //   username: process.env.REDDIT_USERNAME,
   //   password: process.env.REDDIT_PASSWORD,
   // },
-  googleApiKey: process.env.GOOGLE_API_KEY,
 };
 
 const biketag = new BikeTagClient(opts);
 
-const migrateBikeTag = async (client: BikeTagClient) => {
-  /// Get game data from the API
-  const game = (await client.game(opts.game, { source: "sanity" })) as Game;
+export const migrateTags = async (
+  client: BikeTagClient,
+  {
+    fromSource,
+    toSource,
+    gameName,
+    limit = 0,
+    getGps = false,
+    startingNumber = 0,
+    opts = {},
+    delayMs = 0,
+    dryRun = false,
+  }: {
+    fromSource: string;
+    toSource: string;
+    gameName: string;
+    limit?: number;
+    getGps?: boolean;
+    startingNumber?: number;
+    opts?: any;
+    delayMs?: number;
+    dryRun?: boolean;
+  }
+) => {
+  const game = (await client.game(migrateFromFileGame, {
+    source: "sanity",
+  })) as Game;
 
-  if (!game) {
-    return console.log("no game, no dice");
+  console.log("Loaded game config:", game);
+
+  const sourceTagsResponse =  (
+    await client.getTags({ game: gameName }, { source: fromSource })
+  );
+
+  if (!sourceTagsResponse.data?.length) {
+    console.log(`No tags found in source: ${fromSource}`);
+    return;
   }
 
-  /// Set and get the new configuration using the mainhash from the game
+  const sourceTags = sourceTagsResponse.data
+
+  let tags = sourceTags
+    .filter((tag) => typeof tag?.tagnumber === "number")
+    .filter((tag) => tag.tagnumber >= startingNumber)
+    .sort((a, b) => a.tagnumber - b.tagnumber);
+
+  if (limit > 0) {
+    console.log(
+      `Limiting to first ${limit} tags after startingNumber ${startingNumber}`
+    );
+    tags = tags.slice(0, limit);
+  }
+
+  console.log(
+    `Starting ${dryRun ? "dry run" : "real"} migration of ${
+      tags.length
+    } tags from ${fromSource} → ${toSource}`
+  );
+
+  let successCount = 0;
+  let failCount = 0;
+  
+
+  if (toSource === 'aws') {
+    client.config(
+    {
+      aws: {
+        region: game.awsRegion,
+      },
+    },
+    false,
+    true);
+  }
+
+  for (let i = 0; i < tags.length; i++) {
+    const tag = tags[i];
+    tag.game = tag.game ?? gameName;
+    tag.slug = tag.slug ?? tag.name ?? `${gameName}-tag-${tag.tagnumber}`;
+
+    console.log(`[${i + 1}/${tags.length}] Processing tag #${tag.tagnumber}`);
+
+    if (
+      getGps &&
+      (!tag.gps || (tag.gps.lat === 0 || tag.gps.long === 0)) &&
+      tag.foundLocation
+    ) {
+      const gps = await getBikeTagGPSLocation(tag, game);
+      if (gps) {
+        tag.gps = gps;
+        console.log(`→ Added GPS to tag ${tag.tagnumber}:`, gps);
+      } else {
+        console.warn(`→ Could not determine GPS for tag ${tag.tagnumber}`);
+      }
+    }
+
+    if (dryRun) {
+      console.log(`→ Would update tag ${tag.tagnumber}:`, tag);
+    } else {
+      try {
+        const res = 
+          await client.updateTag(
+            { ...tag, resize: doResizeOnUpload },
+            { source: toSource }
+          );
+        if (res.success) {
+          console.log(`✓ Updated tag ${tag.tagnumber} → ${toSource}`);
+          successCount++;
+        } else {
+          console.error(`✗ Failed to update tag ${tag.tagnumber}`, res.error);
+          failCount++;
+        }
+      } catch (err) {
+        console.error(`✗ Exception during tag update ${tag.tagnumber}`, err);
+        failCount++;
+      }
+    }
+
+    if (delayMs > 0) {
+      await delay(delayMs);
+    }
+  }
+
+  console.log(
+    `\n✅ Migration complete (${
+      dryRun ? "dry run" : "real"
+    }): ${successCount} succeeded, ${failCount} failed.`
+  );
+};
+
+/// Requires a special build of the biketag API to export the imgur helpers
+const migrateFromImgurAlbumFile = async (
+  client: BikeTagClient,
+  {
+    gameName,
+    migrateFromFile,
+    migrateFromFileGame,
+    dryRun = false,
+    doResizeOnUpload = false,
+    delayMs = 0,
+    getGps = false,
+    startingNumber = 0,
+    limit = 0,
+    opts = {},
+  }: {
+    gameName: string;
+    migrateFromFile: string;
+    migrateFromFileGame: string;
+    dryRun?: boolean;
+    doResizeOnUpload?: boolean;
+    delayMs?: number;
+    getGps?: boolean;
+    startingNumber?: number;
+    limit?: number;
+    opts?: any;
+  }
+) => {
+  const game = (await client.game(
+    { game: gameName },
+    {
+      source: "sanity",
+    }
+  )) as Game;
+
+  if (game.slug !== gameName) {
+    console.warn("⚠ Game name mismatch", { game, expected: gameName });
+  }
+
+  console.log("Loaded game config:", game);
+
   const config = client.config(
     {
-      imgur: {
-        hash: process.env.BIKETAG_DESTINATION_IMGUR_HASH ?? game.mainhash,
+      aws: {
+        region: game.awsRegion,
       },
-      // reddit: {
-      //   subreddit: game.subreddit,
-      // }
     },
     false,
     true
   );
-  const sourceOpts = {
-    hash: process.env.BIKETAG_SOURCE_IMGUR_HASH,
-  };
-  const sourceName = game.mainhash
 
-  const destinationTags = (await client.tags()) as Tag[];
+  console.log("Using AWS config:", config);
 
-  const getDestinationBikeTagByNumber = (tagnumber: number) => {
-    const foundTags = destinationTags.filter((t) => t.tagnumber === tagnumber);
-    if (foundTags.length) {
-      return foundTags[0];
-    }
+  const inputPath = resolve(__dirname, "input", migrateFromFile);
+  const fileContent = readFileSync(inputPath);
+  const albumInfo = JSON.parse(fileContent.toString());
 
-    return null;
-  };
-
-  const tagsResponse = await client.getTags(sourceOpts, {
-    source: process.env.BIKETAG_SOURCE ?? "imgur",
+  const albumImages = albumInfo.data?.images ?? [];
+  const images = helpers.getGroupedImagesByTagnumber(albumImages);
+  const allTags = helpers.getGroupedTagsByTagnumber(images, {
+    game: migrateFromFileGame,
   });
-  const sourceTags: Tag[] = tagsResponse.data.reverse();
-  console.log({sourceTags})
 
-  const getSourceBikeTagByNumber = (tagnumber: number) => {
-    const foundTags = sourceTags.filter((t) => t?.tagnumber === tagnumber);
-    if (foundTags.length) {
-      return foundTags[0];
+  let tags = allTags
+    .filter((tag) => typeof tag?.tagnumber === "number")
+    .filter((tag) => tag.tagnumber >= startingNumber)
+    .sort((a, b) => a.tagnumber - b.tagnumber);
+
+  if (limit > 0) {
+    console.log(
+      `Limiting to first ${limit} tags after startingNumber ${startingNumber}`
+    );
+    tags = tags.slice(0, limit);
+  }
+
+  console.log(
+    `Beginning ${dryRun ? "dry run" : "actual"} migration of ${
+      tags.length
+    } tags from file ${migrateFromFile}, starting at tag #${startingNumber}`
+  );
+
+  let successCount = 0;
+  let failCount = 0;
+
+  for (let i = 0; i < tags.length; ++i) {
+    const tag = tags[i];
+
+    if (
+      getGps &&
+      (!tag.gps || tag.gps.lat === 0 || tag.gps.long === 0) &&
+      tag.foundLocation
+    ) {
+      const gps = await getBikeTagGPSLocation(tag, game);
+      if (gps) {
+        tag.gps = gps;
+        console.log(`→ Added GPS to tag ${tag.tagnumber}:`, gps);
+      } else {
+        console.warn(`→ Could not determine GPS for tag ${tag.tagnumber}`);
+      }
     }
 
-    return null;
-  };
-
-  let updatePromises: Promise<any>[] = [];
-
-  console.log({ game, config, tags: sourceTags.length }); // { source: 'imgur'}
-
-  if (!sourceTags.length) {
-    console.log("no tags to migrate");
-  } else {
-    startingNumber =
-      startingNumber !== 0 ? startingNumber : sourceTags[0].tagnumber;
-    const endingNumber =
-      limit !== 0 ? startingNumber + limit : startingNumber + sourceTags.length;
-    console.log(`migrating ${limit} tags from ${sourceName}`, { startingNumber, endingNumber, downloadingImages, overWriteExistingTags });
-    for (
-      let i = startingNumber, promiseCount = 1;
-      i < endingNumber;
-      ++i, promiseCount++
-    ) {
-      const tag:any = getSourceBikeTagByNumber(i);
-      const existingTag = getDestinationBikeTagByNumber(i);
-
-      let updateTag = true && doProperUpdate;
-
-      if (!tag) { console.log('end of tags to process'); continue; }
-
-      console.log({ retrieving: tag.tagnumber });
-      tag.slug = tag.name =
-        tag.slug?.indexOf(opts.game) === -1 && tag.slug?.indexOf("-") === 0
-          ? `${opts.game}${tag.slug}`
-          : tag.slug;
-      tag.game = tag.game ?? opts.game;
-      let imagePaths = [
-        join(
-          __dirname,
-          tag.game,
-          `BikeTag-${tag.game}-${tag.tagnumber}-found.jpg`
-        ),
-        join(
-          __dirname,
-          tag.game,
-          `BikeTag-${tag.game}-${tag.tagnumber}-mystery.jpg`
-        ),
-      ];
-
-      if (downloadingImages) {
-        const downloadPromises = downloadBikeTagImages(tag);
-        imagePaths = [];
-
-        await Promise.all(downloadPromises).then(
-          async (responses: string[]) => {
-            imagePaths = responses;
-          }
+    if (!dryRun) {
+      console.log(`→ [${i + 1}/${tags.length}] Updating tag:`, tag);
+      try {
+        await client.updateTag(
+          { ...tag, resize: doResizeOnUpload },
+          { source: toSource }
         );
-
-        for (let imagePath of imagePaths) {
-          if (
-            imagePath.length &&
-            existsSync(imagePath) &&
-            (overWriteExistingTags || !existingTag)
-          ) {
-            const imageType =
-              imagePath.indexOf("found") !== -1
-                ? "found"
-                : imagePath.indexOf("mystery") !== -1
-                ? "mystery"
-                : "";
-            const image = await client.uploadTagImage(
-              {
-                tagnumber: tag.tagnumber,
-                type: imageType,
-                stream: createReadStream(imagePath),
-              } as unknown as uploadTagImagePayload,
-              { source: process.env.BIKETAG_DESTINATION ?? "sanity" }
-            );
-
-            if (image.success && image.data?.length) {
-              const imageRef = image.data._id;
-
-              if (imageType === "found") {
-                console.log("successfully updated found tag image", imageRef);
-                tag.foundImage = imageRef;
-              } else {
-                console.log("successfully updated mystery tag image", imageRef);
-                tag.mysteryImage = imageRef;
-              }
-            } else {
-              console.log("could not upload image", imageType, image);
-            }
-          } else if (overWriteExistingTags) {
-            updateTag = false;
-          }
-        }
+        console.log(`✓ Successfully updated tag ${tag.slug}`);
+        successCount++;
+      } catch (err) {
+        console.error(`✗ Failed to update tag ${tag.slug}`, err);
+        failCount++;
       }
+    } else {
+      console.log(`→ [${i + 1}/${tags.length}] Would update tag:`, tag);
+    }
 
-      if (process.env.GET_GPS === "true") {
-        const gps = await getBikeTagGPSLocation(tag, { ...opts, ...game });
-        if (gps) {
-          tag.gps = gps;
-        }
-      }
-
-      if (!doProperUpdate) {
-        console.log({ wouldUpdate: tag });
-      }
-
-      if (updateTag) {
-        console.log({ updating: tag });
-
-        updatePromises.push(
-          client.updateTag(tag, {
-            source: process.env.BIKETAG_DESTINATION ?? "sanity",
-          })
-        );
-
-        if (promiseCount >= 15) {
-          promiseCount = 0;
-          await Promise.all(updatePromises);
-        }
-      }
+    if (delayMs > 0) {
+      await delay(delayMs);
     }
   }
 
-  await Promise.all(updatePromises).then((updates: any) => {
-    // console.log({ updates });
-    for (const update of updates) {
-      console.log(
-        update.success ? "Success!" : "FAIL",
-        update
-      );
-    }
-  });
+  console.log(
+    `\n🟢 Completed ${dryRun ? "dry run" : "real"} migration of ${
+      tags.length
+    } tags (✓ ${successCount}, ✗ ${failCount})`
+  );
 };
 
-migrateBikeTag(biketag);
+if (migrateFromFile?.length) {
+  migrateFromImgurAlbumFile(biketag, {
+    gameName,
+    migrateFromFile,
+    migrateFromFileGame,
+    doResizeOnUpload,
+    dryRun,
+    delayMs,
+    limit,
+    opts,
+    getGps,
+    startingNumber,
+  });
+} else {
+  migrateTags(biketag, {
+    fromSource,
+    toSource,
+    gameName,
+    dryRun,
+    limit,
+    getGps,
+    startingNumber,
+    opts,
+    delayMs,
+  });
+}

@@ -6,6 +6,7 @@
   "scripts": {
     "test": "ts-node test.ts",
     "update": "ts-node update.ts",
+    "compile": "ts-node compile.ts",
     "import": "ts-node import.ts",
     "export": "ts-node export.ts",
     "demigrate": "ts-node demigrate.ts",
@@ -18,10 +19,11 @@
   "license": "ISC",
   "dependencies": {
     "@googlemaps/google-maps-services-js": "^3.3.1",
-    "biketag": "^2.2.3",
+    "biketag": "^3.5.4",
     "dotenv": "^10.0.0",
     "node-fetch": "^3.0.0",
-    "superstruct-ts-transformer": "^0.2.3"
+    "superstruct-ts-transformer": "^0.2.3",
+    "tinycache": "^1.1.2"
   },
   "devDependencies": {
     "@types/node": "^16.11.11",
