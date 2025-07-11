@@ -7,7 +7,6 @@ import { Game, Tag } from "biketag";
 import { helpers } from "biketag";
 import { resolve } from "path";
 import { delay, normalizeLocationInput } from "./helpers";
-import axios from "axios";
 
 const googleMapsClient = new GoogleMapsClient({});
 
@@ -18,6 +17,8 @@ const limit = parseInt(process.env.LIMIT ?? "0");
 const dryRun = process.env.DRY_RUN === "true";
 const migrateFromFile = process.env.MIGRATE_INPUT_FILE;
 const migrateFromFileGame = process.env.MIGRATE_GAME ?? gameName;
+const compareFile = process.env.MIGRATE_COMPARE_FILE;
+const compareGame = process.env.COMPARE_GAME;
 const doResizeOnUpload = process.env.RESIZE_AND_VARIANTS === "true";
 const fromSource = process.env.BIKETAG_SOURCE ?? "imgur";
 const toSource = process.env.BIKETAG_DESTINATION ?? "aws";
@@ -26,52 +27,6 @@ const delayMs = !Number.isNaN(parseInt(process.env.UPLOAD_DELAY))
   : 200;
 const getGps = process.env.GET_GPS_ON_UPLOAD === "true";
 const googleApiKey = process.env.GOOGLE_API_KEY;
-
-const getBikeTagGPSLocation2 = async (tag: Tag, opts: any) => {
-  const cityContext = opts.region?.zipcode ? `${opts.region.description} ${opts.region.zipcode}` : opts.region?.description;
-
-  const rawInput = (tag.foundLocation ?? "").trim();
-  if (!rawInput) {
-    console.warn("✗ Skipping GPS lookup: empty foundLocation.");
-    return undefined;
-  }
-
-  const normalizedInput = normalizeLocationInput(rawInput);
-  const fullQuery = `${normalizedInput}, ${cityContext}`.trim();
-
-  try {
-    console.log('trying to get gps coordinates for', fullQuery)
-    const boundary = `${opts.boundary.lat},${opts.boundary.lng}`
-    const response = await axios.get("https://maps.googleapis.com/maps/api/geocode/json", {
-      params: {
-        key: googleApiKey,
-        address: fullQuery,
-        ...(opts.boundary && {
-          location: boundary,
-          radius: 1000,
-        }),
-      },
-      timeout: 1000,
-    });
-
-    const result = response.data.results?.[0];
-    const location = result?.geometry?.location;
-
-    if (location?.lat !== undefined && location?.lng !== undefined) {
-      return { lat: location.lat, long: location.lng, alt: 0 };
-    }
-
-    console.warn(`⚠ Geocoding API did not return location for "${fullQuery}"`);
-  } catch (e: any) {
-    console.error(
-      `✗ Geocoding API error for "${rawInput}":`,
-      e?.response?.data?.error_message || `status ${e?.response?.status}`
-    );
-  }
-
-  return undefined;
-};
-
 
 const getBikeTagGPSLocation = async (tag: Tag, opts: any) => {
   const cityContext = opts.region?.zipcode ? `${opts.region.description} ${opts.region.zipcode}` : opts.region?.description;
@@ -126,8 +81,6 @@ const getBikeTagGPSLocation = async (tag: Tag, opts: any) => {
   console.warn(`⚠ No GPS match found for tag ${tag.tagnumber} with input: "${rawInput}"`);
   return undefined;
 };
-
-
 
 if (!gameName?.length) {
   console.log("no game, no dice");
@@ -423,8 +376,252 @@ const migrateFromImgurAlbumFile = async (
   );
 };
 
-if (migrateFromFile?.length) {
-  migrateFromImgurAlbumFile(biketag, {
+const migrateFromFileWithComparison = async (
+  client: BikeTagClient,
+  {
+    gameName,
+    compareGame,
+    migrateFromFile,
+    dryRun = false,
+    doResizeOnUpload = false,
+    delayMs = 0,
+    getGps = false,
+    startingNumber = 0,
+    limit = 0,
+    opts = {},
+  }: {
+    gameName: string;
+    compareGame: string;
+    migrateFromFile: string;
+    dryRun?: boolean;
+    doResizeOnUpload?: boolean;
+    delayMs?: number;
+    getGps?: boolean;
+    startingNumber?: number;
+    limit?: number;
+    opts?: any;
+  }
+) => {
+  const game = (await client.game({ game: gameName }, { source: "sanity" })) as Game;
+  console.log(`Loaded game config for [${gameName}]`, game);
+  client.config({ aws: { region: game.awsRegion } }, false, true);
+
+  const migratePath = resolve(__dirname, "input", migrateFromFile);
+  const migrateFileContent = readFileSync(migratePath);
+  const migrateAlbumInfo = JSON.parse(migrateFileContent.toString());
+  const migrateImages = helpers.getGroupedImagesByTagnumber(migrateAlbumInfo.data?.images ?? []);
+  let migrateFileTags = helpers.getGroupedTagsByTagnumber(migrateImages, { game: gameName });
+  migrateFileTags = migrateFileTags.filter(t => t && typeof t.tagnumber === 'number');
+
+  const currentGameResponse = await client.getTags({ game: gameName }, { source: fromSource });
+  const currentGameTags = currentGameResponse.data ?? [];
+
+  const compareGameResponse = await client.getTags({ game: compareGame }, { source: fromSource });
+  const compareGameTags = compareGameResponse.data ?? [];
+  const comparePlayers: Set<string> = new Set();
+  compareGameTags.forEach(tag => {
+    if (tag.mysteryPlayer) comparePlayers.add(tag.mysteryPlayer);
+    if (tag.foundPlayer) comparePlayers.add(tag.foundPlayer);
+  });
+  console.log(`Loaded ${comparePlayers.size} unique players from [${compareGame}] as reference.`);
+
+  const filteredTags = currentGameTags
+    .filter(tag => typeof tag?.tagnumber === "number")
+    .filter(tag => tag.tagnumber >= startingNumber)
+    .sort((a, b) => a.tagnumber - b.tagnumber);
+
+  const tagsToAnalyze = limit > 0 ? filteredTags.slice(0, limit) : filteredTags;
+  console.log(`Processing ${tagsToAnalyze.length} tags for [${gameName}]...`);
+
+  let successCount = 0;
+  let failCount = 0;
+  let repairedCount = 0;
+  let untouchedCount = 0;
+  let skippedCount = 0;
+
+  let previousMysteryPlayer: string | null = null;
+  let previousFoundPlayer: string | null = null;
+  let previousFoundPlayerRepaired = false;
+
+  const normalize = (str: string) =>
+    str
+      .toLowerCase()
+      .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const isClearlyCorrupt = (loc: string): boolean => {
+    const trimmed = loc.trim();
+    return (
+      trimmed.length < 6 ||
+      trimmed.endsWith(')') ||
+      trimmed.split(/\s+/).length < 2
+    );
+  };
+
+  for (let i = 0; i < tagsToAnalyze.length; i++) {
+    const tag = tagsToAnalyze[i];
+    const nextTag = currentGameTags.find(t => t.tagnumber === tag.tagnumber + 1);
+    const migrateFileTag = migrateFileTags.find(t => t.tagnumber === tag.tagnumber);
+
+    let outputTag = { ...tag };
+    let didRepair = false;
+    let foundPlayerWasRepaired = false;
+
+    if (migrateFileTag) {
+      if (migrateFileTag.mysteryImageUrl) {
+        outputTag.mysteryImageUrl = migrateFileTag.mysteryImageUrl;
+        outputTag.mysteryTime = migrateFileTag.mysteryTime;
+        didRepair = true;
+      }
+
+      if (migrateFileTag.foundImageUrl) {
+        outputTag.foundImageUrl = migrateFileTag.foundImageUrl;
+        outputTag.foundTime = migrateFileTag.foundTime;
+        didRepair = true;
+      }
+    }
+
+    let playerChainIssue = false;
+    if (outputTag.foundPlayer === outputTag.mysteryPlayer) {
+      console.warn(`⚠ Tag ${tag.tagnumber} suspicious: foundPlayer === mysteryPlayer (${outputTag.foundPlayer})`);
+
+      if (nextTag && nextTag.mysteryPlayer) {
+        console.log(`→ Repairing foundPlayer on tag ${tag.tagnumber} using nextTag.mysteryPlayer: ${nextTag.mysteryPlayer}`);
+        outputTag.foundPlayer = nextTag.mysteryPlayer;
+        didRepair = true;
+        foundPlayerWasRepaired = true;
+      } else if (previousMysteryPlayer) {
+        console.log(`→ Repairing foundPlayer on tag ${tag.tagnumber} using previousMysteryPlayer: ${previousMysteryPlayer}`);
+        outputTag.foundPlayer = previousMysteryPlayer;
+        didRepair = true;
+        foundPlayerWasRepaired = true;
+      }
+      playerChainIssue = true;
+    }
+
+    if (previousFoundPlayer && !previousFoundPlayerRepaired && outputTag.mysteryPlayer !== previousFoundPlayer) {
+      console.warn(`⚠ Player chain mismatch at tag ${tag.tagnumber}: previousFoundPlayer=${previousFoundPlayer} but mysteryPlayer=${outputTag.mysteryPlayer}`);
+      console.log(`→ Repairing mysteryPlayer on tag ${tag.tagnumber} using previousFoundPlayer: ${previousFoundPlayer}`);
+      outputTag.mysteryPlayer = previousFoundPlayer;
+      didRepair = true;
+    }
+
+    const overlappingPlayers: string[] = [];
+    if (comparePlayers.has(outputTag.mysteryPlayer ?? '')) overlappingPlayers.push(`mysteryPlayer: ${outputTag.mysteryPlayer}`);
+    if (comparePlayers.has(outputTag.foundPlayer ?? '')) overlappingPlayers.push(`foundPlayer: ${outputTag.foundPlayer}`);
+
+    if (overlappingPlayers.length > 0) {
+      console.warn(`⚠ Tag ${tag.tagnumber} has player(s) that also appear in [${compareGame}]: ${overlappingPlayers.join(', ')}`);
+    }
+
+    if (playerChainIssue && overlappingPlayers.length > 0) {
+      console.warn(`⚠ Tag ${tag.tagnumber} suspicious due to player chain + compareGame overlap.`);
+    }
+
+    if (
+      outputTag.foundLocation &&
+      outputTag.hint &&
+      outputTag.foundLocation.trim().length > 3 &&
+      outputTag.hint.trim().length > 3
+    ) {
+      const normHint = normalize(outputTag.hint);
+      const normFoundLocation = normalize(outputTag.foundLocation);
+
+      const isCorrupt =
+        normHint.includes(normFoundLocation) ||
+        normFoundLocation.includes(normHint) ||
+        isClearlyCorrupt(outputTag.foundLocation);
+
+      if (isCorrupt) {
+        console.warn(
+          `⚠ Suspicious or clearly corrupt foundLocation detected on tag ${tag.tagnumber}:\n  foundLocation: "${outputTag.foundLocation}"\n  hint: "${outputTag.hint}"`
+        );
+
+        if (
+          migrateFileTag?.foundLocation &&
+          migrateFileTag.foundLocation.trim().length > 3 &&
+          migrateFileTag.foundLocation !== outputTag.foundLocation
+        ) {
+          console.log(
+            `→ Repairing foundLocation for tag ${tag.tagnumber}: "${outputTag.foundLocation}" → "${migrateFileTag.foundLocation}"`
+          );
+          outputTag.foundLocation = migrateFileTag.foundLocation;
+          didRepair = true;
+        } else {
+          console.log(`→ No fallback foundLocation for tag ${tag.tagnumber}, forcibly clearing foundLocation.`);
+          outputTag.foundLocation = undefined;
+          didRepair = true;
+        }
+      }
+    }
+
+    if (getGps && (!outputTag.gps || outputTag.gps.lat === 0 || outputTag.gps.long === 0) && outputTag.foundLocation) {
+      const regionName = (game.region as any)?.name ?? game.region;
+      const regionZip = (game.region as any)?.zipcode ?? '';
+      console.log(`→ Trying GPS lookup for: "${outputTag.foundLocation} ${regionName} ${regionZip}"`);
+      const gps = await getBikeTagGPSLocation(outputTag, game);
+      if (gps) {
+        outputTag.gps = gps;
+        console.log(`→ Added GPS to tag ${tag.tagnumber}:`, gps);
+      } else {
+        console.warn(`→ Could not determine GPS for tag ${tag.tagnumber}`);
+      }
+    }
+
+    if (!didRepair && migrateFileTag) {
+      console.log(`→ [${tag.tagnumber}] No repairs needed`);
+      untouchedCount++;
+    }
+
+    if (dryRun) {
+      console.log(`→ [${tag.tagnumber}] Would update tag:`, outputTag);
+      successCount++;
+    } else {
+      try {
+        await client.updateTag({ ...outputTag, resize: doResizeOnUpload }, { source: toSource });
+        console.log(`✓ Updated tag ${tag.tagnumber}`);
+        successCount++;
+      } catch (err) {
+        console.error(`✗ Failed to update tag ${tag.tagnumber}`, err);
+        failCount++;
+      }
+    }
+
+    if (didRepair) repairedCount++;
+
+    previousMysteryPlayer = outputTag.mysteryPlayer ?? null;
+    previousFoundPlayer = outputTag.foundPlayer ?? null;
+    previousFoundPlayerRepaired = foundPlayerWasRepaired;
+
+    if (delayMs > 0) await delay(delayMs);
+  }
+
+  console.log(`\n✅ migrateFromFileWithComparison complete:
+  - ${successCount} succeeded
+  - ${failCount} failed
+  - ${repairedCount} repaired
+  - ${skippedCount} skipped
+  - ${untouchedCount} untouched
+  - dryRun: ${dryRun ? 'yes' : 'no'}`);
+};
+
+
+if (migrateFromFile?.length && compareFile?.length) {
+  migrateFromFileWithComparison(biketag, {
+    gameName,
+    migrateFromFile,
+    doResizeOnUpload,
+    dryRun,
+    delayMs,
+    compareGame,
+    limit,
+    opts,
+    getGps,
+    startingNumber,
+  });
+} else if (migrateFromFile?.length) {
+    migrateFromImgurAlbumFile(biketag, {
     gameName,
     migrateFromFile,
     migrateFromFileGame,

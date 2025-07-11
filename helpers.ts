@@ -102,3 +102,12 @@ export const normalizeLocationInput = (input: string): string => {
 export const isNumberedStreet = (str: string): boolean => {
   return /^\d{1,3}(st|nd|rd|th)?(?:\s+(Ave|Avenue|St|Street|Blvd|Way|Rd))?$/i.test(str.trim());
 };
+
+export const rateLimited = async <T>(fn: () => Promise<T>, minTime = 1100): Promise<T> => {
+  const start = Date.now();
+  const result = await fn();
+  const elapsed = Date.now() - start;
+  const wait = minTime - elapsed;
+  if (wait > 0) await delay(wait);
+  return result;
+};

@@ -9,6 +9,8 @@
     "compile": "ts-node compile.ts",
     "import": "ts-node import.ts",
     "export": "ts-node export.ts",
+    "sort": "ts-node sort.ts",
+    "setup": "ts-node setup.ts",
     "demigrate": "ts-node demigrate.ts",
     "migrate": "ts-node migrate.ts",
     "delete": "ts-node delete.ts",
